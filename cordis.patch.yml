@@ -1,0 +1,85 @@
+# dsh-teacher-consult bundle patch:
+# inserts the host-side plugin (lib/index.js via the package root export).
+#
+# This row is INDEPENDENT of dsh-agent-mailbox. The mailbox is a long-lived
+# DSH <-> codex channel on one persistent thread; the teachers here are
+# stateless one-shot `codex exec` runs that never resume anybody's thread.
+# Neither plugin reads or writes the other's state, so the mailbox's model,
+# thread, tools and behaviour are untouched by this row.
+#
+# Model / effort pairs below were verified against this machine's live catalog
+# (~/.codex/models_cache.json, codex-cli 0.153.4) and by a real `codex exec`
+# call before being written here. The plugin re-validates every pair at load
+# and at each consult, and refuses rather than substituting a different model.
+- insert:
+    - id: teacher-consult
+      name: dsh-teacher-consult
+      config:
+        enabled: true
+
+        # --- where teachers run -------------------------------------------------
+        # Empty = the live session cwd.
+        workspace: ""
+        # Empty = auto-discover under ~/AppData/Local/OpenAI/Codex/bin/*/codex.exe
+        codexPath: ""
+        # read-only | workspace-write | danger-full-access
+        # Teachers are "can read, cannot write": the default is read-only and it
+        # is enforced by the codex sandbox, verified by a real write attempt.
+        sandbox: read-only
+        # No session files on disk: a consult leaves no thread behind to be
+        # resumed, which is what makes the teachers stateless by construction.
+        # Verified: a consult leaves ~/.codex/sessions unchanged.
+        ephemeral: true
+        # MEASURED on the GPT-6 roster: a real two-file consult cost astra/low 32s
+        # and sol/medium 51s. The first value tried was 180000, which the
+        # GPT-5.6-era sol/medium consult hit almost exactly (178s), so 300000
+        # keeps a wide margin on the slowest normal-tier observation.
+        consultTimeoutMs: 300000
+        # The escalation tier gets its own, larger ceiling. MEASURED: astra/max on
+        # the same question took 87s and 78k cumulative input tokens, against 51s
+        # for the primary tier. The GPT-5.6-era escalation was far worse -- 439s
+        # and 1,364,745 cumulative input tokens, because a turn re-sends its whole
+        # context on every tool round trip. That is the second reason the shared
+        # slot admits exactly one per task.
+        escalationTimeoutMs: 600000
+
+        # --- teacher roster -----------------------------------------------------
+        # GPT plan teacher: steps, risks, what to verify first.
+        planModel: gpt-6-astra
+        planEffort: low
+
+        # GPT expert teacher, primary tier: the first expert consult only.
+        expertPrimaryModel: gpt-6-sol
+        expertPrimaryEffort: medium
+
+        # GPT expert teacher, escalation tier: one step up, never first.
+        # GPT-6 Astra is the flagship of this generation (the catalog describes it
+        # as state-of-the-art in coding, computer use and professional work), so
+        # the promotion moves the expert line onto it at `max`. Chosen over
+        # sol/max and luna/max on MEASURED cost for the same question and the same
+        # two files: sol/max 57s/46k, astra/max 87s/78k, luna/max 90s/164k.
+        # `ultra` exists on astra and is deliberately NOT used -- it enables
+        # automatic task delegation, which is wrong for a one-shot consult.
+        expertEscalationModel: gpt-6-astra
+        expertEscalationEffort: max
+
+        # --- consult budget, per real human user task ---------------------------
+        # 1 plan + 1 expert primary + 1 shared slot = 3 teacher replies maximum.
+        # The shared slot is either a follow-up to an existing teacher OR the
+        # expert promotion to the escalation tier -- never both.
+        planConsultsMax: 1
+        expertPrimaryMax: 1
+        followupOrEscalationMax: 1
+
+        # --- Jev advisory budget ------------------------------------------------
+        # Advisory only: Jev never sends a consult and has no hard trigger.
+        maxAdvisoriesPerTask: 2
+        jevModel: jev-latest
+        jevTimeoutMs: 5000
+        # Deterministic trimming ceiling for the TeacherState (never a second
+        # model summary; if it cannot fit, the advisory is skipped).
+        teacherStateTokenBudget: 2000
+
+        # Empty = ~/.dsh/teacher-consult/consults.jsonl
+        logPath: ""
+        logEnabled: true

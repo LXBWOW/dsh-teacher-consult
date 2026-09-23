@@ -1,0 +1,12 @@
+# Normalise line endings: the repository stores LF regardless of the OS that
+# checks it out, so diffs stay readable across Windows / Linux / macOS.
+* text=auto eol=lf
+
+# Binary assets must not be line-ending converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

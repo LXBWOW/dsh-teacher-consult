@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+!.env.example
+
+# Local consult logs and analysis output.
+*.log
+*.jsonl
+consult*.json
+analysis*.json
+
+# OS noise.
+Thumbs.db
+.DS_Store

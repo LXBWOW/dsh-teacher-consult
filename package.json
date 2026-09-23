@@ -1,0 +1,21 @@
+{
+  "name": "dsh-teacher-consult",
+  "version": "0.1.0",
+  "description": "GPT teacher consults for DSH: stateless one-shot codex teachers (GPT plan teacher / GPT expert teacher) behind a hard per-task consult budget, an optional Jev advisory, a read-only sandbox and a deterministic prefilter.",
+  "type": "module",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test/selfcheck.mjs",
+    "test:live": "node test/selfcheck.mjs --live",
+    "models": "node tools/list-models.mjs"
+  },
+  "dependencies": {}
+}
