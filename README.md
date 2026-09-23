@@ -1,5 +1,7 @@
 # dsh-teacher-consult — DSH 的 GPT 老师系统
 
+[English](README.en.md) | **简体中文**
+
 DSH（学生）可以就复杂任务向两位老师要建议：
 
 | 老师 | 默认模型 | effort | 只回答 |
