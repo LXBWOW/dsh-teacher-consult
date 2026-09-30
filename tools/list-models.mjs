@@ -5,7 +5,7 @@
  *
  * This exists because the roster is data, not an opinion: before changing a
  * teacher's model or effort, this is the command that says whether the pair is
- * real. `node tools/list-models.mjs gpt-6-astra max` answers the single question
+ * real. `node tools/list-models.mjs gpt-6-sol max` answers the single question
  * "is this pair valid?" with an exit code.
  */
 

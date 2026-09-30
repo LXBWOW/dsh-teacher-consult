@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+import { advisoryMessage } from '../lib/index.js';
+import { isUserAuthored } from '../lib/budget.js';
+const hostModules = process.env.DSH_HOST_NODE_MODULES || 'C:/Program Files/DSH Desktop/resources/app/node_modules';
+const { releasedV4SessionFormatCodec: codec } = await import(pathToFileURL(hostModules + '/@deepseek-ai/dsh-session-format-v3-to-v4/lib/index.js').href);
+const message = advisoryMessage('format v4 regression');
+const event = { type: 'user/message', seq: 0, time: Date.now(), data: message };
+assert.equal(isUserAuthored(message.source), false);
+assert.throws(() => codec.encodeEvent({ ...event, data: { ...message, source: { kind: 'plugin', plugin: 'teacher-consult', form: 'advisory' } } }), /producer-owned/);
+const header = codec.encodeHeader({ version: 4, id: 'teacher-v4-fixture', createdAt: Date.now(), delegationDepth: 0, isSeeded: false }, 0);
+const decoder = codec.createDecoder(header, 'strict');
+const events = [];
+const context = { emitEvent: event => events.push(event), emitRun: run => events.push(...run.expand()) };
+decoder.decodeRow(JSON.parse(JSON.stringify(codec.encodeEvent(event))), context);
+decoder.finish(context);
+assert.deepEqual(events[0].data, message);
+console.log('PASS: original advisory rejected; current advisory round-trips through native v4 and remains non-user-authored');

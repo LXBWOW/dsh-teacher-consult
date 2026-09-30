@@ -28,13 +28,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { DEFAULTS, loadModelCatalog, timeoutForRole, validateProfile } from '../lib/config.js';
-import { createBudget, isUserAuthored } from '../lib/budget.js';
+import { createBudget, isUserAuthored, describeRequest } from '../lib/budget.js';
 import { prefilter } from '../lib/prefilter.js';
 import { buildPrompt, PLAN_ROLE, EXPERT_ROLE, PREFIX } from '../lib/prompts.js';
 import { buildTeacherState, decideAdvisory, TEACHER_QUESTION_SET_HASH } from '../lib/teacher-state.js';
 import { buildConsultArgs, parseJsonEvents, runConsult } from '../lib/codex.js';
-import { ConsultLog, consultRow, summarize, readRows } from '../lib/log.js';
-import { apply, checkReplyFormat, extractTaskText, missingPaths, workspaceOf } from '../lib/index.js';
+import { ConsultLog, consultRow, renderStatus, summarize, readRows } from '../lib/log.js';
+import { consultGate } from '../lib/consult-gate.js';
+import { createAdvisoryTracker, majorChangeFor, questionKeys, detectExplicitRequest } from '../lib/advisory.js';
+import { apply, checkReplyFormat, extractTaskText, missingPaths, workspaceOf, advisoryMessage } from '../lib/index.js';
 
 const LIVE = process.argv.includes('--live');
 const WORKSPACE = process.env.TEACHER_TEST_WORKSPACE || process.cwd();
@@ -58,14 +60,22 @@ function skip(name, why) {
 function makeHost(config) {
   const handlers = new Map();
   const tools = [];
+  const routes = [];
   const notes = [];
   const ctx = {
     on(event, handler) {
       if (!handlers.has(event)) handlers.set(event, []);
       handlers.get(event).push(handler);
     },
-    inject(_deps, fn) {
-      fn({ tools: { register(tool) { tools.push(tool); } } });
+    inject(deps, fn) {
+      const scope = { tools: { register(tool) { tools.push(tool); } } };
+      // The plugin soft-depends on webServer for its read-only status route. A
+      // host without one must still load — that is why the scope is only filled
+      // in when the dependency was actually requested.
+      if (deps.includes('webServer')) {
+        scope.webServer = { register(route) { routes.push(route); return () => {}; } };
+      }
+      fn(scope);
     },
     effect(fn) { fn(); },
     logger: { warn: (m) => notes.push(`warn: ${m}`), info: (m) => notes.push(`info: ${m}`) },
@@ -73,6 +83,7 @@ function makeHost(config) {
   apply(ctx, config);
   return {
     tools,
+    routes,
     notes,
     tool: (name) => {
       const found = tools.find((t) => t.name === name);
@@ -85,7 +96,56 @@ function makeHost(config) {
   };
 }
 
-/** A human-authored user message: the only thing that opens a task. */
+// ── the network guard ────────────────────────────────────────────────────────
+//
+// The FIRST advisory of a task is automatic now, so ANY test that emits a human
+// task reaches out to Jev. Intercepting every request here is what keeps this
+// file offline and deterministic. Nothing in the offline tier may touch the real
+// TypeSafe API; the `--live` tier exercises codex, not Jev.
+const network = [];
+/** The probabilities the mock Jev answers with. A test may replace this. */
+let jevAnswer = {
+  planning_help_would_reduce_rework: 0.2,
+  expert_help_would_reduce_risk: 0.2,
+  agent_can_proceed_without_teacher: 0.9,
+};
+/** 'ok' | 'http' | 'malformed' | 'throw' — how the mock should misbehave. */
+let jevMode = 'ok';
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  network.push({ url: String(url), init });
+  if (jevMode === 'throw') throw new Error('selfcheck: mocked network failure');
+  if (jevMode === 'http') return { ok: false, status: 500, text: async () => 'mocked server error' };
+  if (jevMode === 'malformed') return { ok: true, status: 200, text: async () => '{not json' };
+  return {
+    ok: true,
+    status: 200,
+    text: async () =>
+      JSON.stringify({
+        answers: Object.fromEntries(Object.entries(jevAnswer).map(([k, v]) => [k, { noul: v }])),
+        model: 'jev-mock',
+      }),
+  };
+};
+/** Reset the mock to a known verdict. */
+function setJev({ planning = 0.2, expert = 0.2, selfSufficient = 0.9, mode = 'ok' } = {}) {
+  jevAnswer = {
+    planning_help_would_reduce_rework: planning,
+    expert_help_would_reduce_risk: expert,
+    agent_can_proceed_without_teacher: selfSufficient,
+  };
+  jevMode = mode;
+}
+/** Requests made since a mark taken with `network.length`. */
+const since = (mark) => network.length - mark;
+
+/**
+ * A human-authored user message: the only thing that opens a task.
+ *
+ * The automatic advisory it starts is awaited by every tool entry point, so a
+ * test does not need to flush anything: `await tool.execute(...)` already orders
+ * the two correctly, which is the same ordering the host provides.
+ */
 function humanMessage(text) {
   return {
     type: 'user/message',
@@ -104,7 +164,22 @@ function syntheticMessage(text, kind) {
 const execFor = (id) => ({ agent: { session: { header: { id } } } });
 
 function baseConfig(extra = {}) {
-  return { ...DEFAULTS, workspace: WORKSPACE, logPath: join(scratch, 'consults.jsonl'), ...extra };
+  return {
+    ...DEFAULTS,
+    workspace: WORKSPACE,
+    logPath: join(scratch, 'consults.jsonl'),
+    /**
+     * The offline tier must never reach a real codex binary.
+     *
+     * `findCodex` returns null for an explicit path that does not exist rather
+     * than falling back to auto-discovery, so this pin makes "no teacher model was
+     * called" a structural property of the offline run instead of a hope about
+     * which code paths a test happens to exercise. The `--live` tier genuinely
+     * needs the real binary, so the pin is absent there.
+     */
+    ...(LIVE ? {} : { codexPath: join(scratch, 'no-such-codex-binary') }),
+    ...extra,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +210,8 @@ console.log('\n-- 1. simple task: no advisory, no teacher --');
     const out = await host.tool('teacher_advisory').execute({ goal: 'fix a typo' }, execFor('s-simple'));
     record('1d simple task: advisory short-circuits before Jev', calls.length === 0,
       `${calls.length} network call(s); result: ${out.split('\n')[0]}`);
-    record('1e simple task: the answer says proceed', out.includes('no advisory, no teacher'));
+    record('1e simple task: a manual call returns the cache, it does not buy an evaluation',
+      out.includes('not re-evaluated') && out.includes('obviously_simple'), out.split('\n').slice(0, 2).join(' | '));
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -143,7 +219,9 @@ console.log('\n-- 1. simple task: no advisory, no teacher --');
   const host = makeHost(baseConfig());
   host.emit('session/event', { id: 's-simple2' }, humanMessage('fix the typo in the README'));
   const advisory = await host.tool('teacher_advisory').execute({ goal: 'x' }, execFor('s-simple2'));
-  record('1f simple task: no teacher is consulted', advisory.includes('No advisor was called'));
+  record('1f simple task: the automatic advisory says none, with its reason',
+    advisory.includes('suggestion: none') && advisory.includes('obviously_simple'),
+    advisory.split('\n').slice(0, 3).join(' | '));
 }
 
 // ---------------------------------------------------------------------------
@@ -162,9 +240,10 @@ console.log('\n-- 2. roster + argv --');
     record('2c expert primary pair is valid', primary.ok === true, primary.error ?? `${DEFAULTS.expertPrimaryModel}/${DEFAULTS.expertPrimaryEffort}`);
     record('2d expert escalation pair is valid', escalation.ok === true, escalation.error ?? `${DEFAULTS.expertEscalationModel}/${DEFAULTS.expertEscalationEffort}`);
 
-    // Deliberately NOT DEFAULTS.expertEscalationModel any more: the GPT-6
-    // escalation model (astra) DOES support `ultra`, so that pair is legal and
-    // proves nothing here. gpt-6-luna is the GPT-6 model whose list stops at max.
+    // Deliberately NOT DEFAULTS.expertEscalationModel: the expert models
+    // (gpt-6-sol, and its successor gpt-6.1-sol) DO support `ultra`, so that
+    // pair is legal and proves nothing here. gpt-6-luna is the model whose
+    // list stops at max.
     const bogus = validateProfile({ model: 'gpt-6-luna', effort: 'ultra' }, catalog);
     record('2e an unsupported effort is REFUSED, not substituted', bogus.ok === false, bogus.error ?? '');
     const missing = validateProfile({ model: 'gpt-9-nope', effort: 'low' }, catalog);
@@ -262,20 +341,122 @@ console.log('\n-- 4. consult budget --');
   d.settle('s3', r.slot, { commit: false });
   record('4l a failed consult returns its slot', d.remaining('s3').plan === 1 && d.consultsUsed('s3') === 0);
 
-  // Advisory budget.
+  // Advisory budget: the STORE counts, `advisory.js` judges.
+  //
+  // This used to assert that the second reservation was refused without a real
+  // escalation signal. That judgement moved to `majorChangeFor`, which now owns
+  // four rules rather than two — keeping it here as well would mean two
+  // components holding an opinion about the same property. What the store still
+  // owns is the ceiling, and that is what is asserted.
   const a = createBudget({ planConsultsMax: 1, expertPrimaryMax: 1, followupOrEscalationMax: 1, maxAdvisoriesPerTask: 2 });
   a.beginTask('s4', a.noteUserTask('s4'));
-  const adv1 = a.reserveAdvisory('s4', { hasFork: false, failedAttempts: 0 });
-  const adv2early = a.reserveAdvisory('s4', { hasFork: false, failedAttempts: 0 });
-  record('4m the second advisory needs a real escalation signal', adv1.ok === true && adv2early.ok === false, adv2early.reason ?? '');
-  const adv2 = a.reserveAdvisory('s4', { hasFork: false, failedAttempts: 2 });
-  const adv3 = a.reserveAdvisory('s4', { hasFork: false, failedAttempts: 5 });
-  record('4n the third advisory is refused outright', adv2.ok === true && adv3.ok === false, adv3.reason ?? '');
+  const adv1 = a.reserveAdvisory('s4');
+  const adv2 = a.reserveAdvisory('s4');
+  record('4m the advisory store counts to its ceiling without judging the facts',
+    adv1.ok === true && adv2.ok === true && adv1.advisoryIndex === 1 && adv2.advisoryIndex === 2,
+    `adv1=${JSON.stringify(adv1)} adv2=${JSON.stringify(adv2)}`);
+  const adv3 = a.reserveAdvisory('s4');
+  record('4n the third advisory is refused outright', adv3.ok === false, adv3.reason ?? '');
 
   record('4o isUserAuthored accepts only kind=user',
     isUserAuthored({ kind: 'user' }) === true &&
       isUserAuthored({ kind: 'plugin' }) === false &&
       isUserAuthored({ kind: 'subagent-settled' }) === false);
+
+  // ── the promotion may cross a task boundary ───────────────────────────────
+  //
+  // The rule was "escalation needs a primary in THIS task", which made a session
+  // that had just paid 105 seconds for a primary refuse its own escalation as
+  // soon as the human typed another message. The window below is the fix, and
+  // these three cases pin it from both sides.
+  const w = createBudget({
+    planConsultsMax: 1,
+    expertPrimaryMax: 1,
+    followupOrEscalationMax: 1,
+    maxAdvisoriesPerTask: 2,
+    escalationLookbackTasks: 5,
+  });
+  w.beginTask('s5', w.noteUserTask('s5'));
+  const wPrimary = w.reserve('s5', { teacher: 'expert', mode: 'primary' });
+  w.settle('s5', wPrimary.slot, { commit: true, teacher: 'expert', mode: 'primary' });
+  w.beginTask('s5', w.noteUserTask('s5'));
+  const wEscalation = w.reserve('s5', { teacher: 'expert', mode: 'escalation' });
+  record(
+    '4p an escalation in a later task promotes a recent primary',
+    wEscalation.ok === true && wEscalation.slot === 'shared',
+    `slot=${wEscalation.slot} age=${w.primaryAgeTasks('s5')}`,
+  );
+  w.settle('s5', wEscalation.slot, { commit: true, teacher: 'expert', mode: 'escalation' });
+  record('4q the cross-task promotion still spends the shared slot',
+    w.remaining('s5').followup_or_escalation === 0 && w.consultsUsed('s5') === 1,
+    `remaining=${JSON.stringify(w.remaining('s5'))}`);
+
+  const x = createBudget({
+    planConsultsMax: 1,
+    expertPrimaryMax: 1,
+    followupOrEscalationMax: 1,
+    maxAdvisoriesPerTask: 2,
+    escalationLookbackTasks: 2,
+  });
+  x.beginTask('s6', x.noteUserTask('s6'));
+  const xPrimary = x.reserve('s6', { teacher: 'expert', mode: 'primary' });
+  x.settle('s6', xPrimary.slot, { commit: true, teacher: 'expert', mode: 'primary' });
+  for (let i = 0; i < 3; i += 1) x.beginTask('s6', x.noteUserTask('s6'));
+  const xEscalation = x.reserve('s6', { teacher: 'expert', mode: 'escalation' });
+  record(
+    '4r the window closes: an old primary no longer licenses an escalation',
+    xEscalation.ok === false && x.primaryAgeTasks('s6') === 3,
+    `age=${x.primaryAgeTasks('s6')} reason=${xEscalation.reason ?? ''}`,
+  );
+
+  const y = createBudget({
+    planConsultsMax: 1,
+    expertPrimaryMax: 1,
+    followupOrEscalationMax: 1,
+    maxAdvisoriesPerTask: 2,
+    escalationLookbackTasks: 5,
+  });
+  y.beginTask('s7', y.noteUserTask('s7'));
+  const yPrimary = y.reserve('s7', { teacher: 'expert', mode: 'primary' });
+  y.settle('s7', yPrimary.slot, { commit: false });
+  y.beginTask('s7', y.noteUserTask('s7'));
+  const yEscalation = y.reserve('s7', { teacher: 'expert', mode: 'escalation' });
+  record(
+    '4s a primary that got no reply does not license an escalation',
+    yEscalation.ok === false && y.primaryAgeTasks('s7') === null,
+    yEscalation.reason ?? '',
+  );
+
+  // The diagnostic that would have saved a real debugging round: a refusal has
+  // to name the request it judged, or a missing `mode` looks like a broken
+  // counter (see the budget header note).
+  record(
+    '4t a refusal can name the request it judged',
+    describeRequest({ teacher: 'expert', mode: 'primary', followup: false }) === 'expert/primary' &&
+      describeRequest({ teacher: 'expert', mode: 'escalation' }) === 'expert/escalation' &&
+      describeRequest({ teacher: 'expert', mode: null, followup: true }) === 'expert/followup' &&
+      describeRequest({ teacher: 'plan', mode: null }) === 'plan',
+    `${describeRequest({ teacher: 'expert', mode: 'primary' })} / ${describeRequest({ teacher: 'expert', mode: null, followup: true })}`,
+  );
+
+  // The status text has to answer "can I still escalate?" itself: deriving it by
+  // hand from the remaining counts is what produced a wrong diagnosis once.
+  const statusText = renderStatus({
+    enabled: true,
+    disabledReason: '',
+    logPath: join(scratch, 'consults.jsonl'),
+    logWritable: true,
+    codexPath: 'codex',
+    rosterVerified: true,
+    profiles: { plan: { model: 'gpt-6-astra', effort: 'low' } },
+    summary: summarize([]),
+    task: w.describe('s5'),
+  });
+  record(
+    '4u the status text names the escalation window',
+    statusText.includes('escalation: last primary') && statusText.includes('window 5'),
+    statusText.split('\n').filter((line) => line.includes('escalation:')).join(' | '),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +541,7 @@ console.log('\n-- 7. log --');
 {
   const row = consultRow({
     taskKey: 's#task1', sessionId: 's', teacher: 'expert', expertMode: 'escalation',
-    model: 'gpt-6-astra', reasoningEffort: 'max', consultIndex: 3, slot: 'shared',
+    model: 'gpt-6-sol', reasoningEffort: 'max', consultIndex: 3, slot: 'shared',
     sandbox: 'read-only', ephemeral: true, promptChars: 900,
     usage: { input_tokens: 19000, output_tokens: 120 }, latencyMs: 41000, reply: 'RECOMMENDATION:\nx',
     formatOk: true, outcome: 'answered', advisory: { suggestion: 'expert', probabilities: { a: 0.7 }, latencyMs: 400 },
@@ -401,11 +582,19 @@ console.log('\n-- 8. plugin-level refusals (no process spawned) --');
     refused.includes('REFUSED') && refused.includes('No consult was made'), refused.split('\n')[0]);
 
   const host = makeHost(baseConfig());
+  // An advisory that PERMITS the expert tier, so the escalation is judged on its
+  // own eligibility rather than being stopped one step earlier by `advisory_none`
+  // — the gate checks the advisory before the eligibility rules, on purpose.
+  setJev({ planning: 0.3, expert: 0.8, selfSufficient: 0.1 });
   host.emit('session/event', { id: 's-o' }, humanMessage('plan the migration'));
   const firstEscalation = await host.tool('ask_gpt_expert_teacher').execute(
     { goal: 'g', question: 'q', mode: 'escalation' }, execFor('s-o'));
+  // Refused by the Consult Gate now rather than by the budget, because "primary
+  // before escalation" is the gate's ordering rule. The identifier is asserted
+  // rather than the prose, so the check survives a reworded message.
   record('8b escalation-first is refused before spawning',
-    firstEscalation.includes('REFUSED') && firstEscalation.includes('never a first choice'), firstEscalation.split('\n')[0]);
+    firstEscalation.includes('REFUSED') && firstEscalation.includes('escalation_primary_required'),
+    firstEscalation.split('\n').slice(0, 2).join(' | '));
 
   const badFollow = await host.tool('ask_gpt_plan_teacher').execute(
     { goal: 'g', question: 'q', followup: true, previous_reply: 'x' }, execFor('s-o'));
@@ -439,6 +628,280 @@ console.log('\n-- 8. plugin-level refusals (no process spawned) --');
   const after = await statusTool.execute({}, execFor('s-sy'));
   record('8g a synthetic user-role message does not open a new task',
     after.includes('task1') && !after.includes('task2'), after.split('\n').find((l) => l.startsWith('current task')) ?? '');
+}
+
+// ---------------------------------------------------------------------------
+// 9. The read-only status route behind the 协作中心 panel
+// ---------------------------------------------------------------------------
+//
+// The panel polls this route on a timer. Two properties have to hold or the
+// panel is a liability rather than a view: reading it must cost nothing (no
+// consult slot, no Jev call), and it must not be reachable from off the machine.
+console.log('\n-- 9. status route (read-only, loopback) --');
+{
+  const host = makeHost(baseConfig());
+  // The set stays small and fully enumerable: a status read, one body read, and
+  // one body clear. Pinning the count is what would notice a fourth route
+  // appearing without anyone deciding to add it.
+  record('9a exactly three routes are registered (status, body read, body clear)',
+    host.routes.length === 3, `routes=${host.routes.length} -> ${host.routes.map((r) => r.path).join(', ')}`);
+  const route = host.routes[0];
+  record('9b the route is the exact loopback status path',
+    route?.path === '/teacher-consult/status' && route?.kind === 'exact',
+    `${String(route?.path)} kind=${String(route?.kind)}`);
+
+  const bodyRoute = host.routes.find((r) => r.path === '/teacher-consult/message');
+  const clearRoute = host.routes.find((r) => r.path === '/teacher-consult/messages/clear');
+  record('9a2 the two body routes are exact paths of their own',
+    bodyRoute !== undefined && clearRoute !== undefined &&
+      bodyRoute.kind === 'exact' && clearRoute.kind === 'exact',
+    `${String(bodyRoute?.path)} kind=${String(bodyRoute?.kind)} / ${String(clearRoute?.path)} kind=${String(clearRoute?.kind)}`);
+
+  /** Drive the route handler with a fake request/response pair. */
+  const call = async (req) => {
+    let body = '';
+    const res = {
+      status: 0,
+      writeHead(status) { this.status = status; },
+      end(text) { body = text; },
+    };
+    await route.handler(req, res);
+    let parsed = null;
+    try { parsed = JSON.parse(body); } catch { parsed = null; }
+    return { status: res.status, body, json: parsed };
+  };
+  const loopback = { method: 'GET', headers: { host: '127.0.0.1:43120' } };
+
+  const okRes = await call(loopback);
+  record('9c loopback GET answers 200 with JSON',
+    okRes.status === 200 && okRes.json !== null, `status=${okRes.status}`);
+
+  const p = okRes.json ?? {};
+  record('9d the payload carries the full roster',
+    p.profiles?.plan?.model === 'gpt-6-astra' && p.profiles?.plan?.effort === 'low' &&
+      p.profiles?.expertPrimary?.model === 'gpt-6.1-sol' &&
+      p.profiles?.expertPrimary?.effort === 'low' &&
+      p.profiles?.expertEscalation?.model === 'gpt-6.1-sol' &&
+      p.profiles?.expertEscalation?.effort === 'high',
+    JSON.stringify(p.profiles));
+
+  const postRes = await call({ method: 'POST', headers: { host: '127.0.0.1:43120' } });
+  record('9e a write method is refused (there is no consult path here)',
+    postRes.status === 405, `status=${postRes.status}`);
+
+  const lanRes = await call({ method: 'GET', headers: { host: '192.168.1.10:43120' } });
+  record('9f a non-loopback host is refused', lanRes.status === 403, `status=${lanRes.status}`);
+
+  // The property that makes polling free: N reads, zero movement in the ledger.
+  host.emit('session/event', { id: 's-route' }, humanMessage('plan the migration'));
+  const before = (await call(loopback)).json?.task;
+  await call(loopback);
+  await call(loopback);
+  const afterThree = (await call(loopback)).json?.task;
+  record('9g reading the status neither spends budget nor calls Jev',
+    before !== null && afterThree !== null &&
+      JSON.stringify(before.remaining) === JSON.stringify(afterThree.remaining) &&
+      before.advisories === afterThree.advisories &&
+      JSON.stringify(before.consults) === JSON.stringify(afterThree.consults),
+    `${JSON.stringify(before?.remaining)} -> ${JSON.stringify(afterThree?.remaining)}`);
+
+  record('9h the payload exposes no key, env or full reply',
+    !('key' in p) && !('apiKey' in p) && !('env' in p) &&
+      Object.keys(p.jev ?? {}).sort().join(',') === 'model,source' &&
+      (p.consults ?? []).every((row) => !('reply' in row) && String(row.reply_head ?? '').length <= 240),
+    `jev=${JSON.stringify(p.jev)}`);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Jev decides WHETHER to ask; the Consult Gate decides WHETHER IT MAY SEND
+// ---------------------------------------------------------------------------
+//
+// No teacher model is ever spawned here. A host is pointed at a codex path that
+// does not exist, and `findCodex` returns null for an explicit missing path
+// rather than falling back to the real binary — so "the gate let it through"
+// shows up as "the consult then failed for want of a codex", which is exactly
+// the distinction these checks need, at zero model cost.
+console.log('\n-- 10. advisory trigger + Consult Gate --');
+{
+  const MISSING_CODEX = join(scratch, 'no-such-codex-binary');
+  const gateHost = (extra = {}) => makeHost(baseConfig({ codexPath: MISSING_CODEX, ...extra }));
+  const gateRefused = (text) => text.includes('REFUSED by the Consult Gate');
+  const reachedSpawn = (text) => text.includes('FAILED and the slot was returned');
+
+  // ── 10a. obviously simple: no advisory, no consult, no process ─────────────
+  setJev({});
+  {
+    const mark = network.length;
+    const host = gateHost();
+    host.emit('session/event', { id: 'g-simple' }, humanMessage('已重启'));
+    const status = await host.tool('teacher_status').execute({}, execFor('g-simple'));
+    const asked = await host.tool('ask_gpt_plan_teacher').execute({ goal: 'g', question: 'q' }, execFor('g-simple'));
+    record('10a 「已重启」 buys no Jev call, no advisory and no consult',
+      since(mark) === 0 &&
+        status.includes('skipped: obviously_simple') &&
+        asked.includes('advisory_none') &&
+        !reachedSpawn(asked),
+      `jev=${since(mark)} skipped=${status.includes('skipped')} blocked=${asked.includes('advisory_none')}`);
+  }
+
+  // ── 10b/10c. a complex task: ONE automatic advisory, and plan is allowed ───
+  setJev({ planning: 0.8, expert: 0.3, selfSufficient: 0.1 });
+  const planHost = gateHost();
+  {
+    const mark = network.length;
+    planHost.emit('session/event', { id: 'g-plan' }, humanMessage('design a migration plan for the teacher plugin'));
+    const asked = await planHost.tool('ask_gpt_plan_teacher').execute({ goal: 'g', question: 'q' }, execFor('g-plan'));
+    record('10b a complex task buys exactly one automatic evaluation suggesting plan',
+      since(mark) === 1, `jev=${since(mark)}`);
+    record('10c the plan teacher is allowed through the gate',
+      !gateRefused(asked) && reachedSpawn(asked), asked.split('\n')[0]);
+  }
+
+  // ── 10d. advisory = plan refuses a direct expert request ───────────────────
+  {
+    const asked = await planHost.tool('ask_gpt_expert_teacher').execute(
+      { goal: 'g', question: 'a different question entirely' }, execFor('g-plan'));
+    record('10d an advisory of plan refuses an expert upgrade',
+      asked.includes('advisory_level'), asked.split('\n').slice(0, 2).join(' | '));
+  }
+
+  // ── 10e. advisory = expert allows expert AND the cheaper plan ──────────────
+  setJev({ planning: 0.3, expert: 0.85, selfSufficient: 0.1 });
+  {
+    const host = gateHost();
+    host.emit('session/event', { id: 'g-exp' }, humanMessage('design a migration plan for the teacher plugin'));
+    const expert = await host.tool('ask_gpt_expert_teacher').execute(
+      { goal: 'g', question: 'why does the lane queue stall' }, execFor('g-exp'));
+    const cheaper = await host.tool('ask_gpt_plan_teacher').execute(
+      { goal: 'g', question: 'what order should these land in' }, execFor('g-exp'));
+    record('10e an advisory of expert permits expert and the plan downgrade',
+      !gateRefused(expert) && !gateRefused(cheaper),
+      `expert=${expert.split('\n')[0]} | plan=${cheaper.split('\n')[0]}`);
+  }
+
+  // ── 10f. duplicate protection is deterministic and costs no slot ───────────
+  {
+    const key = questionKeys({ teacher: 'plan', mode: null, question: 'why is the mailbox slow' })[0];
+    const dup = consultGate({
+      taskKey: 't#task1', teacher: 'plan', mode: null, question: '  Why  is the MAILBOX  slow ',
+      advisory: { suggestion: 'plan' }, remainingTotal: 3, consultsUsed: 0, hasPrimary: false,
+      teacherAnswered: false, advisoriesUsed: 1, seenQuestionKeys: [key],
+    });
+    record('10f the same question in different case/spacing is a duplicate',
+      dup.allowed === false && dup.blockedBy === 'duplicate_consult', `${dup.blockedBy}: ${dup.reason}`);
+    const escSame = consultGate({
+      taskKey: 't#task1', teacher: 'expert', mode: 'escalation', question: 'why is the mailbox slow',
+      advisory: { suggestion: 'expert' }, remainingTotal: 1, consultsUsed: 1, hasPrimary: true,
+      teacherAnswered: true, advisoriesUsed: 2,
+      seenQuestionKeys: questionKeys({ teacher: 'expert', mode: 'primary', question: 'why is the mailbox slow' }),
+    });
+    record('10g escalating the SAME question is a duplicate, not a new consultation',
+      escSame.allowed === false && escSame.blockedBy === 'duplicate_consult', escSame.reason);
+  }
+
+  // ── 10h..10j. escalation eligibility, rule by rule ─────────────────────────
+  {
+    const esc = (over) => consultGate({
+      taskKey: 't#task1', teacher: 'expert', mode: 'escalation', question: 'the primary left this open',
+      advisory: { suggestion: 'expert' }, remainingTotal: 1, consultsUsed: 1, teacherAnswered: true,
+      advisoriesUsed: 2, seenQuestionKeys: [], ...over,
+    });
+    const noPrimary = esc({ hasPrimary: false });
+    record('10h escalation without a completed primary is refused',
+      noPrimary.blockedBy === 'escalation_primary_required', noPrimary.blockedBy ?? '');
+    const oneEval = esc({ hasPrimary: true, advisoriesUsed: 1 });
+    record('10i escalation with only one evaluation is refused',
+      oneEval.blockedBy === 'escalation_second_advisory_required', oneEval.blockedBy ?? '');
+    const wrongLevel = esc({ hasPrimary: true, advisory: { suggestion: 'plan' } });
+    // The gate checks the advisory's level BEFORE escalation eligibility, in the
+    // order the design specifies. So a second advisory of `plan` is refused as
+    // `advisory_level` — that IS the "second suggestion must be expert" rule, and
+    // reporting it under the level check avoids a second component owning the
+    // same judgement.
+    record('10j escalation after a second advisory of plan is refused',
+      wrongLevel.blockedBy === 'advisory_level', wrongLevel.blockedBy ?? '');
+    const allowed = esc({ hasPrimary: true });
+    record('10k primary + second expert advisory + shared slot = escalation allowed',
+      allowed.allowed === true, allowed.reason);
+  }
+
+  // ── 10l. the four major-change rules ───────────────────────────────────────
+  {
+    const t = createAdvisoryTracker();
+    const first = (facts) => {
+      t.beginTask('s-major', 't#task1', null);
+      t.record('s-major', { index: 1, trigger: 'task_start', suggestion: 'plan', facts });
+      return { first: t.first('s-major') };
+    };
+    // The automatic path records only `{ goal, currentProblem }`, so the fixture
+    // matches it: a first advisory with NO failure field at all. Comparing
+    // against an absent field is the bug this shape exists to catch.
+    const clean = first({ goal: 'a task', currentProblem: 'a problem' });
+    record('10l no change leaves the first advisory standing',
+      majorChangeFor(clean, { failedAttempts: 0 }, { consultsUsed: 0 }).ok === false);
+    record('10m >= 2 failures AFTER the first advisory permit a second',
+      majorChangeFor(clean, { failedAttempts: 2 }, { consultsUsed: 0 }).rule === 'repeated_failure');
+    record('10n a new architecture fork permits a second',
+      majorChangeFor(clean, { hasArchitectureFork: true }, { consultsUsed: 0 }).rule === 'new_architecture_fork');
+    record('10o a new blocking issue permits a second',
+      majorChangeFor(clean, { blockingIssue: 'cannot reproduce it' }, { consultsUsed: 0 }).rule === 'new_blocking_issue');
+    const alreadyFailing = first({ goal: 'a task', failedAttempts: 3 });
+    record('10p new evidence after a teacher reply permits a second',
+      majorChangeFor(alreadyFailing, { failedAttempts: 3 }, { consultsUsed: 1 }).rule === 'unresolved_after_teacher_reply');
+    record('10q the same facts with NO teacher reply do not',
+      majorChangeFor(alreadyFailing, { failedAttempts: 3 }, { consultsUsed: 0 }).ok === false);
+  }
+
+  // ── 10r. the evaluation ceiling, observed through the real entry point ─────
+  setJev({ planning: 0.8, expert: 0.3, selfSufficient: 0.1 });
+  {
+    const mark = network.length;
+    const host = gateHost();
+    host.emit('session/event', { id: 'g-adv' }, humanMessage('design a migration plan for the teacher plugin'));
+    const first = await host.tool('teacher_advisory').execute({ goal: 'g' }, execFor('g-adv'));
+    const afterCache = since(mark);
+    const second = await host.tool('teacher_advisory').execute({ goal: 'g', failed_attempts: 2 }, execFor('g-adv'));
+    const afterSecond = since(mark);
+    const third = await host.tool('teacher_advisory').execute({ goal: 'g', failed_attempts: 9 }, execFor('g-adv'));
+    record('10r one automatic evaluation, one permitted re-evaluation, then a cache hit',
+      afterCache === 1 && afterSecond === 2 && since(mark) === 2 && third.includes('not re-evaluated'),
+      `jev=${afterCache}/${afterSecond}/${since(mark)} | 1st=${first.split('\n')[0]} | 2nd=${second.split('\n')[0]}`);
+  }
+
+  // ── 10s. an explicit human request ─────────────────────────────────────────
+  setJev({ planning: 0.1, expert: 0.1, selfSufficient: 0.95 });
+  {
+    const host = gateHost();
+    host.emit('session/event', { id: 'g-ovr' }, humanMessage('已重启，去问计划老师'));
+    const asked = await host.tool('ask_gpt_plan_teacher').execute({ goal: 'g', question: 'what next' }, execFor('g-ovr'));
+    record('10s an explicit human request lifts advisory=none',
+      !gateRefused(asked) && reachedSpawn(asked), asked.split('\n')[0]);
+
+    const wrongTier = await host.tool('ask_gpt_expert_teacher').execute(
+      { goal: 'g', question: 'an unrelated question' }, execFor('g-ovr'));
+    record('10t the request named the PLAN teacher, so an expert is still refused',
+      gateRefused(wrongTier) && wrongTier.includes('advisory_none'), wrongTier.split('\n').slice(0, 2).join(' | '));
+
+    const fourth = consultGate({
+      taskKey: 't#task1', teacher: 'expert', mode: 'primary', question: 'anything at all',
+      advisory: { suggestion: 'none' }, explicitRequest: 'expert', remainingTotal: 0, consultsUsed: 3,
+      hasPrimary: true, teacherAnswered: true, advisoriesUsed: 2, seenQuestionKeys: [],
+    });
+    record('10u an explicit request cannot buy a fourth consult',
+      fourth.allowed === false && fourth.blockedBy === 'budget_exhausted', fourth.blockedBy ?? '');
+  }
+
+  // ── 10v/10w. the injected note is not a human message ──────────────────────
+  {
+    const note = advisoryMessage('[Teacher advisory]\nsuggestion: plan');
+    record('10v the advisory note is plugin-sourced, so it cannot open a task',
+      note.source?.kind === 'plugin:teacher-consult' && isUserAuthored(note.source) === false, JSON.stringify(note.source));
+    record('10w explicit-request detection is text-only and tier-aware',
+      detectExplicitRequest('去问 GPT计划老师') === 'plan' &&
+        detectExplicitRequest('请 GPT专家老师看看') === 'expert' &&
+        detectExplicitRequest('让老师评审一下') === 'any' &&
+        detectExplicitRequest('no teacher here') === null);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -476,14 +939,14 @@ if (LIVE) {
 
   const expertReply = await host.tool('ask_gpt_expert_teacher').execute(
     { goal: taskA, question: 'Should the three teachers share the codex CLI invocation path?', mode: 'primary' }, execFor('s-live'));
-  record('L3 the expert primary tier (sol/medium) answers',
-    expertReply.includes('gpt-6-sol/medium') && (expertReply.includes('RECOMMENDATION:') || expertReply.includes('WHY:')),
+  record('L3 the expert primary tier (gpt-6.1-sol/low) answers',
+    expertReply.includes('gpt-6.1-sol/low') && (expertReply.includes('RECOMMENDATION:') || expertReply.includes('WHY:')),
     expertReply.split('\n').slice(0, 5).join(' / ').slice(0, 320));
 
   const escReply = await host.tool('ask_gpt_expert_teacher').execute(
     { goal: taskA, question: 'Given the above, is the shared-invocation design a mistake?', mode: 'escalation' }, execFor('s-live'));
   record('L4 the escalation tier runs and is consult #3 of the task',
-    escReply.includes('gpt-6-astra/max') && escReply.includes('consult #3'),
+    escReply.includes('gpt-6.1-sol/high') && escReply.includes('consult #3'),
     escReply.split('\n').slice(0, 4).join(' / ').slice(0, 320));
 
   const fourth = await host.tool('ask_gpt_plan_teacher').execute({ goal: taskA, question: 'one more?' }, execFor('s-live'));

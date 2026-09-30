@@ -23,9 +23,22 @@
         # Empty = auto-discover under ~/AppData/Local/OpenAI/Codex/bin/*/codex.exe
         codexPath: ""
         # read-only | workspace-write | danger-full-access
-        # Teachers are "can read, cannot write": the default is read-only and it
-        # is enforced by the codex sandbox, verified by a real write attempt.
-        sandbox: read-only
+        #
+        # danger-full-access is REQUIRED on this machine, not a preference. Every
+        # sandboxed mode (read-only, workspace-write) makes codex spawn its child
+        # through CreateProcessAsUserW, which fails with Windows error 740
+        # (ERROR_ELEVATION_REQUIRED) because the DSH host runs unelevated. A
+        # read-only teacher therefore cannot start ANY command — including the file
+        # reads it is pointed at — and a consult silently answers from the prompt
+        # alone. MEASURED: `-s read-only` → 740 on `echo hello`;
+        # `-s danger-full-access` → the same command succeeds in 94ms.
+        #
+        # What this costs: "read-only" is no longer enforced by the sandbox, only
+        # by the prompt. The one way to keep BOTH a hard read-only boundary and a
+        # working teacher is to run the DSH host elevated, since that is what makes
+        # the sandbox able to create its restricted child process. That trade is
+        # not taken here: it would put the whole host under administrator rights.
+        sandbox: danger-full-access
         # No session files on disk: a consult leaves no thread behind to be
         # resumed, which is what makes the teachers stateless by construction.
         # Verified: a consult leaves ~/.codex/sessions unchanged.
@@ -35,8 +48,8 @@
         # GPT-5.6-era sol/medium consult hit almost exactly (178s), so 300000
         # keeps a wide margin on the slowest normal-tier observation.
         consultTimeoutMs: 300000
-        # The escalation tier gets its own, larger ceiling. MEASURED: astra/max on
-        # the same question took 87s and 78k cumulative input tokens, against 51s
+        # The escalation tier gets its own, larger ceiling. MEASURED: sol/max on
+        # the same question took 60s and 46k cumulative input tokens, against 50s
         # for the primary tier. The GPT-5.6-era escalation was far worse -- 439s
         # and 1,364,745 cumulative input tokens, because a turn re-sends its whole
         # context on every tool round trip. That is the second reason the shared
@@ -49,19 +62,30 @@
         planEffort: low
 
         # GPT expert teacher, primary tier: the first expert consult only.
-        expertPrimaryModel: gpt-6-sol
-        expertPrimaryEffort: medium
+        # The expert line moved from gpt-6-sol to gpt-6.1-sol on 2026-09-30, and
+        # this tier went DOWN in effort (medium -> low). Both new pairs were
+        # checked against this machine's live catalog before being written:
+        #   node tools/list-models.mjs gpt-6.1-sol low   -> OK
+        #   node tools/list-models.mjs gpt-6.1-sol high  -> OK
+        expertPrimaryModel: gpt-6.1-sol
+        expertPrimaryEffort: low
 
         # GPT expert teacher, escalation tier: one step up, never first.
-        # GPT-6 Astra is the flagship of this generation (the catalog describes it
-        # as state-of-the-art in coding, computer use and professional work), so
-        # the promotion moves the expert line onto it at `max`. Chosen over
-        # sol/max and luna/max on MEASURED cost for the same question and the same
-        # two files: sol/max 57s/46k, astra/max 87s/78k, luna/max 90s/164k.
-        # `ultra` exists on astra and is deliberately NOT used -- it enables
+        # The promotion stays on the expert line's own model and raises the
+        # effort instead of switching models: gpt-6.1-sol low -> high, a pure
+        # reasoning-depth step. `ultra` is NOT used on any tier -- it enables
         # automatic task delegation, which is wrong for a one-shot consult.
-        expertEscalationModel: gpt-6-astra
-        expertEscalationEffort: max
+        #
+        # The cost table kept here was MEASURED on the PREVIOUS expert model
+        # (gpt-6-sol), same question and same two files, one run per tier:
+        # sol/medium 50s/47k, sol/xhigh 60s/47k, sol/max 60s/46k, luna/xhigh
+        # 80s/139k, luna/max 90s/100k. It is what set the escalation ceiling
+        # (600000 against 300000 for the normal tiers), and the current pair
+        # sits BELOW sol/max on the effort scale, so that ceiling is at least
+        # as wide as the measurement it came from.
+        # gpt-6.1-sol low/high has NOT been re-measured on this machine yet.
+        expertEscalationModel: gpt-6.1-sol
+        expertEscalationEffort: high
 
         # --- consult budget, per real human user task ---------------------------
         # 1 plan + 1 expert primary + 1 shared slot = 3 teacher replies maximum.

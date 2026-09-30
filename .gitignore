@@ -12,3 +12,6 @@ analysis*.json
 # OS noise.
 Thumbs.db
 .DS_Store
+
+# 误建目录（脚本把 %SystemDrive% 当字面路径用了），非仓库内容
+%SystemDrive%/
