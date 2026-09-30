@@ -1,151 +1,200 @@
-# dsh-teacher-consult — a GPT teacher system for DSH
+# dsh-teacher-consult — DSH 的 GPT 老师系统
 
-**English** | [简体中文](README.zh-CN.md)
+**简体中文** | [English](README.en.md)
 
-DSH (the student) can ask two teachers for advice on complex tasks:
+DSH（学生）可以就复杂任务向两位老师要建议：
 
-| Teacher | Default model | effort | Answers only |
+| 老师 | 默认模型 | effort | 只回答 |
 |---|---|---|---|
-| **GPT plan teacher** | `gpt-6-astra` | `low` | `PLAN:` / `RISKS:` / `VERIFY FIRST:` |
-| **GPT expert teacher** primary | `gpt-6-sol` | `medium` | `RECOMMENDATION:` / `WHY:` / `MAIN RISK:` |
-| **GPT expert teacher** escalation | `gpt-6-astra` | `max` | same as above |
+| **GPT计划老师** | `gpt-6-astra` | `low` | `PLAN:` / `RISKS:` / `VERIFY FIRST:` |
+| **GPT专家老师** primary | `gpt-6.1-sol` | `low` | `RECOMMENDATION:` / `WHY:` / `MAIN RISK:` |
+| **GPT专家老师** escalation | `gpt-6.1-sol` | `high` | 同上 |
 
-Teachers only give advice. They do not take over the task, do not talk to each other, do not modify files, and cannot see DSH's conversation.
+老师只给建议。它不接管任务、不互相通信、不修改文件、看不到 DSH 的对话。
 
-## How it differs from dsh-agent-mailbox (why these are two plugins)
+## 和 dsh-agent-mailbox 的区别（这是两个插件的原因）
 
 | | mailbox | teacher-consult |
 |---|---|---|
-| Peer | a long-lived codex session, one fixed thread | a brand-new `codex exec` every time, no thread |
-| Context | accumulates (measured: 26 turns, 17.7k → 78.6k input) | does not accumulate, starts from zero each time |
-| Purpose | collaborating with, and handing over to, another harness | asking for advice |
-| Write access | `--dangerously-bypass-approvals-and-sandbox` | `-s read-only` (enforced by the sandbox) |
+| 对端 | 长期 codex 会话，一条固定 thread | 每次全新 `codex exec`，无 thread |
+| 上下文 | 累积（实测 26 轮 17.7k→78.6k input） | 不累积，每次从零开始 |
+| 用途 | 与另一个 harness 协作、交接 | 咨询建议 |
+| 写权限 | `--dangerously-bypass-approvals-and-sandbox` | `-s read-only`（沙箱强制） |
 
-The two reference nothing in each other and share no state. From its creation until the GPT-6 migration, this plugin had not touched a single file of the mailbox (the record checked at the time: every file mtime ≤ 2026-09-20, thread rollout 686,140 bytes).
+两者互不引用、不共享状态。本插件从建立到 GPT-6 迁移都没有改动 mailbox 的任何文件
+（当初核对的记录：全部文件 mtime ≤ 2026-09-20，thread rollout 686,140 字节）。
 
-> **Status correction (2026-09-23)**: the mailbox directory *has* been modified since — between 17:17 and 17:18 on 2026-09-22, four files were updated, leaving `.bak-20260922` backups (`lib/index.js` 619→718 lines, `test/selfcheck.mjs` 34975→38628 B, `README.md` 11475→13111 B, `cordis.patch.yml` 989→1404 B, a net addition of `freshSandbox` / `freshEphemeral` / `freshTimeoutMs`). That change is unrelated to the teacher plugin and was not caused by it; `peerModel` is unchanged.
+> **现状更正（2026-09-23）**：mailbox 目录此后确实被改动过 —— 2026-09-22 17:17–17:18
+> 有 4 个文件更新并留下了 `.bak-20260922` 备份（`lib/index.js` 619→718 行、
+> `test/selfcheck.mjs` 34975→38628 B、`README.md` 11475→13111 B、`cordis.patch.yml`
+> 989→1404 B，净增 `freshSandbox` / `freshEphemeral` / `freshTimeoutMs` 三项）。
+> 那次改动与教师插件无关，不是本插件造成的；`peerModel` 未变。
 
-## Four rules enforced in code
+## 四个在代码里强制的规则
 
-1. **Stateless**: the consult command has no `resume`, no thread id, and carries `--ephemeral`.
-   Measured: the file count and total bytes under `~/.codex/sessions` are unchanged — a teacher leaves behind no session that could be resumed.
-   A follow-up must explicitly carry "the teacher's previous reply", because a new session remembers nothing.
-2. **Budget**: per real human user task,
-   `plan 1 + expert primary 1 + shared slot 1 = at most 3 replies`; the 4th is rejected before any process starts.
-   The third slot is **shared**: either one follow-up, or one primary→escalation upgrade — not both.
-3. **Read-only**: `-s read-only` is enforced by the codex sandbox, not by a prompt. Measured: asking a teacher to write a file yields `BLOCKED` and no file is created.
-4. **Advice, not automation**: Jev can only advise and can never initiate a consult; a prefilter decides whether Jev is asked at all.
+1. **无状态**：咨询命令里没有 `resume`、没有 thread id，并带 `--ephemeral`。
+   实测 `~/.codex/sessions` 文件数与总字节数不变 —— 老师不留任何可被 resume 的会话。
+   追问必须显式带上「上一次老师的回复」，因为新会话记不住。
+2. **预算**：每个真实 human user task
+   `plan 1 次 + expert primary 1 次 + 共享名额 1 次 = 最多 3 封回信`，第 4 次在任何进程启动前就被拒绝。
+   第三个名额是**共享**的：要么追问一次，要么 primary→escalation 升档一次，不能都要。
+3. **升档是「升级已有 primary」，它的前置条件跨任务边界**。escalation 需要一次已完成的 expert primary ——
+   在当前 task 内，或在同一会话最近 `escalationLookbackTasks` 个 task 内（默认 **5**）。
+   要求必须同一个 task，会让一个刚花 105 秒买过 primary 的会话在人类敲下下一条消息后立刻失去升档资格。
+   `mode` 必须显式传：不传就是普通 primary 请求；被拒时返回文本会回显它实际判定的请求（`request judged: expert/primary`）。
+4. **只读**：`-s read-only` 由 codex 沙箱执行，不是靠提示词。实测让老师写文件
+   得到 `BLOCKED` 且文件未创建。
+5. **建议而非自动**：Jev 只能建议，永远不能发起咨询；预筛决定是否问 Jev。
 
-## Tools
+## 工具
 
-| Tool | What it does |
+| 工具 | 作用 |
 |---|---|
-| `ask_gpt_plan_teacher` | ask the plan teacher for a plan |
-| `ask_gpt_expert_teacher` | ask the expert teacher (`mode: primary \| escalation`) |
-| `teacher_advisory` | let Jev judge "is this worth asking a teacher", returns `plan \| expert \| none` + three probabilities |
-| `teacher_status` | read-only: statistics over the last 20 log rows + the current task's remaining budget |
+| `ask_gpt_plan_teacher` | 问计划老师要计划 |
+| `ask_gpt_expert_teacher` | 问专家老师（`mode: primary \| escalation`） |
+| `teacher_advisory` | 让 Jev 判断「值不值得问老师」，返回 `plan \| expert \| none` + 三个概率 |
+| `teacher_status` | 只读：最近 20 行日志的统计 + 当前 task 剩余预算 |
 
-The model name cannot be passed by the model itself: `mode` only chooses between `primary` and `escalation`, and the concrete model/effort can only come from the plugin configuration.
+模型名称不能由模型自己传：`mode` 只做 `primary` / `escalation` 二选一，具体 model/effort
+只能来自插件配置。
 
-## Failure policy
+## 失败策略
 
-| Situation | Behaviour |
+| 情况 | 行为 |
 |---|---|
-| Jev fails / times out / no key | does not block, returns "advisory unavailable", DSH decides for itself |
-| Teacher call fails / times out / no reply | returns a clear error, **refunds the slot**, never retries automatically |
-| Model configuration unavailable | that role is refused outright, **never silently swapped for another model** |
+| Jev 失败 / 超时 / 无 key | 不阻塞，返回「advisory unavailable」，DSH 自己决定 |
+| 老师调用失败 / 超时 / 无回复 | 返回明确错误，**退还名额**，不自动重试 |
+| 模型配置不可用 | 该角色直接拒绝，**绝不偷偷换模型** |
 
-## Model validation (fail fast)
+## 模型校验（fail fast）
 
-On load and before every consult the plugin reads `~/.codex/models_cache.json` and validates each (model, effort) pair. An illegal pair is rejected with the list of efforts that model actually supports:
+插件在加载时和每次咨询前读取 `~/.codex/models_cache.json`，校验每个
+(model, effort) 组合。非法组合会被拒绝并给出该模型实际支持的 effort 列表：
 
 ```
 model "gpt-6-luna" does not support reasoning effort "ultra" (supported: low, medium, high, xhigh, max)
 ```
 
-Measured on this machine (codex-cli 0.155.0, 2026-09-23, after GPT-6 shipped and the CLI was upgraded):
+本机实测目录（codex-cli 0.155.0，2026-09-23，GPT-6 发布并升级 CLI 之后）：
 
 ```
+gpt-6.1-sol    low, medium, high, xhigh, max, ultra  <- 专家线（primary low / escalation high）
 gpt-6-astra    low, medium, high, xhigh, max, ultra
-gpt-6-sol      low, medium, high, xhigh, max, ultra
-gpt-6-luna     low, medium, high, xhigh, max        <- no ultra
-gpt-5.6-sol    low, medium, high, xhigh, max, ultra  <- previous generation, still in the local catalogue, no longer used by the teacher system
+gpt-6-sol      low, medium, high, xhigh, max, ultra  <- 上一代专家模型
+gpt-6-luna     low, medium, high, xhigh, max        <- 没有 ultra
+gpt-5.6-sol    low, medium, high, xhigh, max, ultra  <- 旧代仍在本机目录里，但教师系统不再使用
 gpt-5.6-luna   low, medium, high, xhigh, max
 gpt-5.6-terra  low, medium, high, xhigh, max, ultra
 gpt-5.5        low, medium, high, xhigh
 ```
 
-`node tools/list-models.mjs` prints the list; `node tools/list-models.mjs gpt-6-astra max` validates a single pair.
+`node tools/list-models.mjs` 打印清单；`node tools/list-models.mjs gpt-6.1-sol high` 校验单个组合。
 
-## Measured cost and latency (important)
+## 实测成本与耗时（重要）
 
-The consult text itself is only a few hundred to two thousand tokens, but **the cumulative input of one turn is far larger than that**: every tool call a teacher makes re-sends the whole context, so the more files it reads, the larger the bill.
+咨询正文只有几百到两千 token，但**一次 turn 的累计 input 远大于此**：
+老师的每一次工具调用都会重发整段上下文，所以它读的文件越多，账单越大。
 
-GPT-6 roster, measured (same question, both reading `lib/index.js` + `lib/budget.js`):
+GPT-6 roster 实测分两轮。第一轮（同一问题、同样读 `lib/index.js` + `lib/budget.js`，每档一次）：
 
-| Tier | Latency | Cumulative input for that turn | output | reasoning out |
+| 档位 | 耗时 | 该 turn 的累计 input | output | reasoning out |
 |---|---|---|---|---|
-| `gpt-6-sol` / `medium` (primary) | 50.6s | 68,761 | 498 | 101 |
+| `gpt-6-sol` / `medium`（primary） | 50.6s | 68,761 | 498 | 101 |
 | `gpt-6-sol` / `max` | 56.6s | 45,906 | 803 | 517 |
-| `gpt-6-astra` / `max` (**escalation, chosen**) | **86.8s** | **77,952** | 1,456 | 1,032 |
+| `gpt-6-astra` / `max` | 86.8s | 77,952 | 1,456 | 1,032 |
 | `gpt-6-luna` / `max` | 90.2s | 164,223 | 2,454 | 1,763 |
 
-escalation uses `gpt-6-astra` / `max`: astra is this generation's flagship (its own catalogue describes it as state-of-the-art at coding / computer use / professional work) and produced the most complete answers in testing; `luna/max` takes about the same time at twice the price (164k vs 78k). `ultra` is not used — it brings automatic task delegation, which is wrong for a one-shot consult.
+第二轮补测 `xhigh` 档，并在同一个 harness 下重跑两个 `max` 档（同 prompt、同两个文件，每档一次）：
 
-With a minimal prompt (83 characters, no file reads) all four tiers land at roughly 30s / roughly 19k input: that is CLI startup cost and **cannot be used to tell tiers apart**, so tier choice rests on the real-read measurements above.
+| 档位 | 耗时 | 累计 input | output | reasoning out | 工具调用 |
+|---|---|---|---|---|---|
+| `gpt-6-sol` / `medium`（primary） | 49.8s | 47,246 | 419 | 135 | 2 |
+| `gpt-6-sol` / `xhigh` | 60.4s | 47,403 | 632 | 333 | 2 |
+| `gpt-6-sol` / `max`（**escalation，2026-09-30 前**） | **59.8s** | **46,019** | **743** | **480** | **2** |
+| `gpt-6-luna` / `xhigh` | 79.8s | 138,895 | 1,297 | 793 | 4 |
+| `gpt-6-luna` / `max` | 90.1s | 100,079 | 1,875 | 1,402 | 4 |
 
-Previous-generation baseline (historical measurements, kept as-is):
+escalation 现在用 `gpt-6.1-sol` / `high`，primary 用 `gpt-6.1-sol` / `low`（2026-09-30 变更）：
+升档留在专家线自己的模型上、只提高 effort，所以增益是纯粹的推理深度。
+两个新组合已用 `node tools/list-models.mjs gpt-6.1-sol low` / `... high` 核对合法（OK），
+但**尚未在本机重新实测**；上面的表格是选上一版 roster 时用 `gpt-6-sol` 测的，也是档位超时值的依据。
+`sol/xhigh` 答对了同一份 checklist，如果更在意 output token 而不是推理余量，它是等价的另一选择。
+`luna` 用约两倍的价钱没有换来任何额外质量，且每次运行都多出一次与问题无关的 MCP 调用。
+`ultra` 任何档位都不用 —— 它带 automatic task delegation，不适合一次性咨询。
 
-| Tier | Latency | Cumulative input for that turn | output |
+第二轮的说明：累计 input 是每一轮工具调用重发的上下文，所以它跟随"模型选择读多少"，而不是档位本身 ——
+`luna/xhigh` 一次读完 `index.js` 再切片，因此它的 input 反而高于 `luna/max`。单次运行之间 1–3% 的差异没有意义。
+
+同一批次下的极简 prompt（83 字符、不读文件）每个档位都是约 30s / 约 19k input：
+那是 CLI 启动开销，**不能用来区分档位**，所以档位选择只依据上面的真实读取测量。
+
+旧代基线（历史测量，保留不改）：
+
+| 档位 | 耗时 | 该 turn 的累计 input | output |
 |---|---|---|---|
-| `gpt-6-astra` / `low` | roughly 30–120s | tens of k | hundreds |
+| `gpt-6-astra` / `low` | 约 30–120s | 数十 k | 数百 |
 | `gpt-5.6-sol` / `medium` | **178s** | **524,635** | 2,924 |
 | `gpt-5.6-luna` / `high` | 143s | 601,355 | 3,784 |
 | `gpt-5.6-luna` / `max` | **439s** | **1,364,745** | 10,719 |
 
-Two direct consequences (still true after the GPT-6 migration):
+两个直接结论（迁移到 GPT-6 后依然成立）：
 
-1. **Timeouts are split per tier.** `consultTimeoutMs: 300000` (normal tiers; the original 180000 sat right on sol/medium's 178s and would have killed a correct consult), `escalationTimeoutMs: 600000`.
-2. **escalation is an expensive resource.** The previous generation measured 439 seconds and a million-plus cumulative input — one reason the shared slot is released only once per task.
+1. **超时按档位分开**。`consultTimeoutMs: 300000`（普通档；最初的 180000 正好压在
+   sol/medium 的 178s 上，会把一次正确的咨询杀掉），`escalationTimeoutMs: 600000`。
+2. **escalation 是昂贵资源**。旧代实测 439 秒、百万级累计 input —— 这正是共享名额每 task
+   只放行一次的原因之一。
 
-Also, to stop a teacher from roving across the whole repository, the prompt template states plainly: "read only the few files directly relevant to the question, do not walk the whole repository"; the `paths` argument is the intended scope.
+另外，为避免老师漫游整个仓库，提问模板里明确写了
+「只读取与问题直接相关的少量文件，不要遍历整个仓库」；`paths` 参数就是预期范围。
 
-## Where Jev plugs in
+## Jev 的接入点
 
-`teacher_advisory` is **the thinnest possible layer**: it adds no hook and changes no turn flow; it only sends a small TeacherState to Jev and gets three probabilities back.
+`teacher_advisory` 是**最薄的一层**：它不新增钩子、不改任何 turn 流程，
+只把一个小小的 TeacherState 发给 Jev，拿回三个概率。
 
-TeacherState is a whitelist structure — fields such as `transcript` / `diff` / `tool_output` **do not exist at all**, and passing them is dropped and recorded:
+TeacherState 是白名单结构 —— `transcript` / `diff` / `tool_output` 这类字段
+**根本不存在**，传了会被丢弃并记录：
 
 ```
 { goal, current_problem, failed_attempts, touched_areas_n,
   has_architecture_fork, has_multi_step_plan, blocking_issue,
-  plan_used, expert_used, followup_used }
+  plan_used, expert_used, shared_used }
 ```
 
-The cap is roughly 2000 tokens; over that it is trimmed along a fixed `slice` ladder (no second model is asked to summarise); if even the last rung does not fit, the advisory is **skipped** — a truncated state is never sent.
+上限约 2000 token，超了按固定阶梯 `slice` 裁剪（不调第二个模型做摘要）；
+连最后一级都装不下就**跳过 advisory**，绝不发送被截断的状态。
 
-The question set is **three independent questions**, not a reuse of Completion Supervisor's seven:
+问题集是**独立的三问**，不复用 Completion Supervisor 的 7 问：
 
 - `planning_help_would_reduce_rework`
 - `expert_help_would_reduce_risk`
 - `agent_can_proceed_without_teacher`
 
-### Free prefilter (no prefilter hit, no Jev call)
+### 免费预筛（不满足就不调 Jev）
 
-An advisory is only considered when any one of these holds: the user explicitly asks for a plan / architecture / design / migration / refactoring, the task spans multiple modules, two or more designs are still live, there have been ≥ 2 consecutive failures, or there is a blocker the agent cannot explain. For obviously simple tasks: **no Jev call and no teacher.**
+任一成立才允许考虑 advisory：用户明确要求 plan/架构/设计/迁移/重构、任务跨多模块、
+存在两个以上方案分叉、连续失败 ≥ 2、有 agent 无法解释的 blocker。
+明显简单任务：**不调 Jev，也不问老师**。
 
-Advisory budget `max 2 / task`: the first at the entry of a complex task, the second only if ≥ 2 failures follow it or a new architecture fork appears. The third is rejected outright, with no API call.
+advisory 预算 `max 2 / task`：第 1 次在复杂任务入口，第 2 次只在后续出现 ≥2 失败
+或新的架构分叉时。第 3 次直接拒绝，不调 API。
 
-## Where the budget resets
+## 预算的重置边界
 
-It resets on a **real human user task**, not on a synthetic user-role message.
-The test is a **whitelist**: `source.kind === 'user'`, carried over directly from the fix Completion Supervisor already made.
+按**真正 human 的 user task** 重置，不按 synthetic user-role 消息重置。
+判定是**白名单** `source.kind === 'user'` —— 直接沿用 Completion Supervisor 修过的做法。
 
-Why (measured over there): with a deny-list, injections such as `subagent-settled`, `plugin (hindsight)` and `skill-catalog` all counted as new user tasks, so the budget was silently reset several times inside one real task and the cap effectively did not exist.
+原因（那边实测过）：用 deny-list 时 `subagent-settled`、`plugin (hindsight)`、
+`skill-catalog` 等注入都被算成新的用户任务，一个真实 task 内预算被静默重置多次，
+上限等于不存在。
 
-## Install status
+重置的是**每任务的三个名额**；唯一跨任务保留的状态是「最近一次 expert primary 落在第几个 task」
+（`lastPrimaryTask`），升档窗口用它判断。所以新消息带来新的 primary 名额，但不会让升档资格凭空消失。
 
-Registered in `~/.dsh/profiles/desktop/package.json` (the original file is backed up as `package.json.bak-before-teacher-consult`):
+## 安装状态
+
+已注册进 `~/.dsh/profiles/desktop/package.json`（原文件已备份为
+`package.json.bak-before-teacher-consult`）：
 
 ```json
 "dependencies": {
@@ -154,52 +203,66 @@ Registered in `~/.dsh/profiles/desktop/package.json` (the original file is backe
 "dsh": { "profile": { "bundles": [ ..., "dsh-agent-mailbox", "dsh-completion-supervisor", "dsh-teacher-consult" ] } }
 ```
 
-The bundle line is **appended at the end**, following the convention of the other plugins in that directory (dsh replaces a whole line for the same id when a later bundle loads it, so a new id is safest last).
+bundle 行**追加在末尾**，沿用同目录其它插件的约定（dsh 是「后加载者整行替换同名 id」，
+新 id 放最后最安全）。
 
-Two symlinks:
+两处 symlink：
 
-| Location | Points to |
+| 位置 | 指向 |
 |---|---|
 | `dsh-teacher-consult/node_modules/{schemastery,@deepseek-ai}` | `~/.dsh/profiles/desktop/node_modules/*` |
-| `~/.dsh/profiles/desktop/node_modules/dsh-teacher-consult` | this plugin directory |
+| `~/.dsh/profiles/desktop/node_modules/dsh-teacher-consult` | 本插件目录 |
 
-**A DSH restart is required for it to load** (`hmr` is off in the desktop build). Before restarting, resolution was verified inside the profile directory: `import('dsh-teacher-consult')` succeeds and the self-check passes 70/70 through the symlink entry.
+**需要重启 DSH 才会加载**（`hmr` 在桌面版是关的）。重启前已在 profile 目录下验证过
+解析：`import('dsh-teacher-consult')` 成功，symlink 入口下自检 70/70 通过。
 
-Rollback: delete the two JSON entries above, restore the backup file, restart.
+回滚：删掉上面两个 JSON 条目，恢复备份文件，重启。
 
-## Self-check
+## 自检
 
 ```bash
-node test/selfcheck.mjs          # offline, deterministic, seconds
-node test/selfcheck.mjs --live   # adds a real codex consult (about 5 minutes)
+node test/selfcheck.mjs          # 离线、确定性、秒级
+node test/selfcheck.mjs --live   # 加上真实 codex 咨询（约 5 分钟）
 ```
 
-The six things it covers: a simple task asks no teacher / the plan teacher replies in format and changes no file / Sol Medium primary replies / the budget is 1+1+1 and the 4th is rejected / input for two different tasks does not grow linearly / a teacher cannot write to the workspace.
+覆盖的 6 项：简单任务不问老师 / 计划老师按格式回复且不改文件 / `gpt-6.1-sol` primary 回复 /
+预算 1+1+1 且第 4 次被拒 / 升档窗口（跨任务可用、超窗被拒、失败 primary 不开窗） /
+两个不同 task 的 input 不线性增长 / 老师不能写工作区。
 
-## Known boundaries
+## 已知边界
 
-- **A consult blocks**: on the GPT-6 roster one consult measured 32–87 seconds (plan 32s, primary 51s, escalation 87s) and the tool call waits for it. The previous generation's escalation once reached 7 minutes, which is another reason the timeouts stay split per tier. This is intentional — a teacher's advice is by nature a "stop and think" step.
-- **A teacher cannot see DSH's conversation**, nor its own previous consult. A question must either be self-contained or carry the previous reply explicitly in `previous_reply`.
-- **The escalation tier is this machine's candidate** (`gpt-6-astra` / `max`); it has been checked legal and measured. Validate with `tools/list-models.mjs` before changing models.
+- **咨询是阻塞的**：上一代专家模型（`gpt-6-sol`）实测一次真实的两文件咨询 50–60 秒（primary 50s、
+  escalation 60s；计划老师那次真实咨询 56s），工具调用会等它。当前的 `gpt-6.1-sol` 组合尚未重测。
+  旧代 escalation 曾达 7 分钟，这也是超时值一直按档位分开的原因。这是有意的 —— 老师建议本来就是「停下来想一下」的动作。
+- **老师看不到 DSH 的对话**，也看不到上一次咨询。提问要么自包含，要么把上一次回复
+  显式带在 `previous_reply` 里。
+- **escalation 的档位是本机候选**（`gpt-6.1-sol` / `high`），已对活目录核对合法但尚未重测。换模型前
+  先用 `tools/list-models.mjs` 验一遍。
 
-## How the consult workspace is decided (a trap we fell into)
+## 咨询工作区怎么决定（踩过的坑）
 
-When `workspace` is empty, do **not** fall back to `process.cwd()`: that is the working directory of the DSH host process, not the session workspace.
+`workspace` 为空时，**不要**直接用 `process.cwd()`：那是 DSH 宿主进程的工作目录，
+不是会话工作区。
 
-This is not theoretical. The first real consult failed exactly this way: `paths` carried three repo-relative paths, the host cwd was not the repo, so the teacher could read no file at all — and **still replied in the required format**, mentioning only in the body that "all three specified files do not exist, source review not completed". The tool result, the log and the format check were all green.
+这不是理论问题。第一次真实咨询就是这么失败的：`paths` 传了三个仓库内相对路径，
+宿主 cwd 却不是仓库，于是老师读不到任何文件，**仍然按格式回了信**，只在正文里说了
+一句「三个指定文件均不存在，未完成源码核查」。工具结果、日志、format 检查全都是绿的。
 
-The deciding evidence was an existing control experiment: an earlier preflight had used `codex exec -C "<repo>" ... "Read the file dsh-agent-mailbox/cordis.patch.yml"` and successfully read the content. The same relative-path spelling only works when `-C` points at the repo, so that consult's `-C` was not the repo.
+判定依据是一个已有的对照实验：早前 preflight 用
+`codex exec -C "<仓库>" ... "Read the file dsh-agent-mailbox/cordis.patch.yml"` 成功读到了内容。
+同一个相对路径写法只在 `-C` 指向仓库时成立，所以那次咨询的 `-C` 不是仓库。
 
-The current priority order:
+现在的优先级：
 
 ```
-config.workspace (explicit configuration)
-  → agent.session.header.cwd (this session's workspace, recorded at session start)
-    → the recorded per-session mapping
-      → process.cwd() (last resort)
+config.workspace（显式配置）
+  → agent.session.header.cwd（本会话的工作区，session-start 时记录）
+    → 记录的 per-session 映射
+      → process.cwd()（最后兜底）
 ```
 
-Two visibility measures were added so the next failure of this kind is not invisible:
+并且加了两道可见性，让下次同类失败不再隐形：
 
-1. Both the tool result and the log line print `workspace`, so one reply is enough to see which directory the teacher ran in.
-2. Before sending, `missingPaths()` deterministically checks `paths`; anything missing is reported as a `WARNING` after the reply and recorded in the log's `paths_missing` field. A missing path does **not** block the consult — it just is not invisible any more.
+1. 工具结果和日志行都打印 `workspace`，一封信就能看出老师是在哪个目录里跑的。
+2. 发送前用 `missingPaths()` 确定性检查 `paths`，不存在的会在回信后以 `WARNING` 写明，
+   同时记进日志的 `paths_missing` 字段。不存在的路径**不阻塞**咨询，只是不再是隐形的。
